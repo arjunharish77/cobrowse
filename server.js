@@ -8,9 +8,7 @@ app.use(cors());
 app.use(express.json());
 
 const server = http.createServer(app);
-const io = new Server(server, {
-    cors: { origin: "*", methods: ["GET", "POST"] }
-});
+const io = new Server(server, { cors: { origin: "*" } });
 
 const activeLeads = new Map();
 
@@ -21,7 +19,7 @@ app.post("/request-access", (req, res) => {
         io.to(socketId).emit("request-permission");
         return res.json({ success: true, adminUrl: `http://localhost:8080/admin.html?leadId=${leadId}` });
     }
-    res.status(404).json({ error: "Lead not online" });
+    res.status(404).json({ error: "Lead offline" });
 });
 
 io.on("connection", (socket) => {
@@ -32,13 +30,11 @@ io.on("connection", (socket) => {
     });
 
     socket.on("sync-event", (data) => {
-        // Broadcast to everyone in the room EXCEPT the sender
+        // Broadcasts to the other person in the room (one-way only per event)
         socket.to(`room-${socket.leadId}`).emit("sync-event", data);
     });
 
-    socket.on("disconnect", () => {
-        activeLeads.delete(socket.leadId);
-    });
+    socket.on("disconnect", () => activeLeads.delete(socket.leadId));
 });
 
 server.listen(process.env.PORT || 3000);
