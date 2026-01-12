@@ -31,7 +31,16 @@ io.on("connection", (socket) => {
         socket.join(`room-${data.leadId}`);
         if (data.role === "visitor") activeLeads.set(data.leadId, socket.id);
     });
-
+    socket.on("identify", (data) => {
+    socket.leadId = data.leadId;
+    socket.join(`room-${data.leadId}`);
+    if (data.role === "visitor") {
+        activeLeads.set(data.leadId, socket.id);
+    } else if (data.role === "admin") {
+        // When admin joins, ask the visitor in that room to send a fresh DOM
+        socket.to(`room-${data.leadId}`).emit("request-full-dom");
+    }
+});
     socket.on("sync-event", (data) => {
         socket.to(`room-${socket.leadId}`).emit("sync-event", data);
     });
