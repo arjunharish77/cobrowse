@@ -5,12 +5,12 @@ const cors = require("cors");
 
 const app = express();
 app.use(cors());
-app.use(express.json({ limit: '10mb' })); // Allow large HTML snapshots
+app.use(express.json({ limit: '20mb' })); // Increased for high-fidelity HTML
 
 const server = http.createServer(app);
 const io = new Server(server, { 
     cors: { origin: "*" },
-    maxHttpBufferSize: 1e7 // 10MB buffer for Socket.io
+    maxHttpBufferSize: 2e7 // 20MB limit
 });
 
 const activeLeads = new Map();
@@ -36,7 +36,9 @@ io.on("connection", (socket) => {
         socket.to(`room-${socket.leadId}`).emit("sync-event", data);
     });
 
-    socket.on("disconnect", () => activeLeads.delete(socket.leadId));
+    socket.on("disconnect", () => {
+        if (socket.leadId) activeLeads.delete(socket.leadId);
+    });
 });
 
-server.listen(process.env.PORT || 3000);
+server.listen(process.env.PORT || 3000, () => console.log("Server Live"));
