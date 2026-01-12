@@ -1,4 +1,3 @@
-// server.js (Railway)
 "use strict";
 
 const express = require("express");
@@ -8,170 +7,127 @@ const cors = require("cors");
 
 const app = express();
 app.use(cors({ origin: "*" }));
-app.use(express.json({ limit: "2mb" }));
+app.use(express.json());
 
 const server = http.createServer(app);
 const io = new Server(server, {
-  cors: { origin: "*" },
-  maxHttpBufferSize: 2e7, // keep if you ever enable snapshot mode
+  cors: { origin: "*" }
 });
 
-const leadToVisitorSocket = new Map(); // leadId -> socketId
-const leadToAdminSockets = new Map(); // leadId -> Set(socketId)
-const leadState = new Map(); // leadId -> { url, scrollXRatio, scrollYRatio, lastSeen }
+// ---- STATE STORES ----
+const visitorSocketByLead = new Map();     // leadId -> socketId
+const adminSocketsByLead = new Map();      // leadId -> Set(socketId)
+const leadState = new Map();               // leadId -> { url, scrollX, scrollY, permission }
 
-function getRoom(leadId) {
-  return `room-${leadId}`;
-}
+// ---- HELPERS ----
+const room = (leadId) => `room-${leadId}`;
 
 function ensureAdminSet(leadId) {
-  if (!leadToAdminSockets.has(leadId)) {
-    leadToAdminSockets.set(leadId, new Set());
+  if (!adminSocketsByLead.has(leadId)) {
+    adminSocketsByLead.set(leadId, new Set());
   }
-  return leadToAdminSockets.get(leadId);
+  return adminSocketsByLead.get(leadId);
 }
 
-// Optional: allowlist origins you will mirror (recommended for enterprise)
-const ALLOWED_ORIGINS = [
-  // "https://yourdomain.com",
-  // "https://www.yourdomain.com",
-];
-
-function isAllowedUrl(url) {
-  try {
-    const u = new URL(url);
-    if (ALLOWED_ORIGINS.length === 0) return true; // allow all if not set
-    return ALLOWED_ORIGINS.includes(u.origin);
-  } catch {
-    return false;
-  }
-}
-
-// Admin triggers permission popup on visitor
-app.post("/request-access", (req, res) => {
-  const { leadId } = req.body || {};
-  if (!leadId) return res.status(400).json({ error: "leadId is required" });
-
-  const visitorSocketId = leadToVisitorSocket.get(leadId);
-  if (!visitorSocketId) return res.status(404).json({ error: "Lead offline" });
-
-  io.to(visitorSocketId).emit("request-permission", { leadId });
-
-  // For your local admin console
-  return res.json({
-    success: true,
-    adminUrl: `http://localhost:8080/admin.html?leadId=${encodeURIComponent(leadId)}`
-  });
-});
-
+// ---- SOCKET LOGIC ----
 io.on("connection", (socket) => {
-  socket.data = { role: null, leadId: null, granted: false };
+  socket.data = { role: null, leadId: null };
 
   socket.on("identify", ({ leadId, role }) => {
-    if (!leadId || !role) return;
-    socket.data.leadId = String(leadId);
+    leadId = String(leadId);
+    socket.data.leadId = leadId;
     socket.data.role = role;
 
-    socket.join(getRoom(socket.data.leadId));
+    socket.join(room(leadId));
+
+    // Init state if missing
+    if (!leadState.has(leadId)) {
+      leadState.set(leadId, { permission: false });
+    }
 
     if (role === "visitor") {
-      leadToVisitorSocket.set(socket.data.leadId, socket.id);
-      socket.data.granted = false; // permission not granted yet by default
+      visitorSocketByLead.set(leadId, socket.id);
 
-      // tell admins visitor is online
-      socket.to(getRoom(socket.data.leadId)).emit("presence", { leadId: socket.data.leadId, visitor: "online" });
-    }
+      // Notify admins visitor is online
+      socket.to(room(leadId)).emit("presence", { visitor: "online" });
 
-    if (role === "admin") {
-      const set = ensureAdminSet(socket.data.leadId);
-      set.add(socket.id);
+    } else if (role === "admin") {
+      ensureAdminSet(leadId).add(socket.id);
 
-      // if we have cached state, push it immediately
-      const st = leadState.get(socket.data.leadId);
-      if (st?.url) {
-        socket.emit("sync-event", { type: "navigate", url: st.url, from: "server" });
-      }
-      if (typeof st?.scrollXRatio === "number" && typeof st?.scrollYRatio === "number") {
-        socket.emit("sync-event", { type: "v-scroll", x: st.scrollXRatio, y: st.scrollYRatio, from: "server" });
+      const state = leadState.get(leadId);
+
+      // Replay presence
+      if (visitorSocketByLead.has(leadId)) {
+        socket.emit("presence", { visitor: "online" });
       }
 
-      // ask visitor to emit current URL + scroll (if any)
-      socket.to(getRoom(socket.data.leadId)).emit("request-state", { leadId: socket.data.leadId });
+      // Replay permission
+      if (state.permission) {
+        socket.emit("permission-status", { granted: true });
+      }
+
+      // Replay URL + scroll
+      if (state.url) {
+        socket.emit("sync-event", { type: "navigate", url: state.url });
+      }
+      if (typeof state.scrollX === "number") {
+        socket.emit("sync-event", {
+          type: "v-scroll",
+          x: state.scrollX,
+          y: state.scrollY
+        });
+      }
     }
   });
 
-  // Visitor grants permission
   socket.on("permission-granted", ({ leadId }) => {
-    if (!leadId) return;
-    if (socket.data.role !== "visitor") return;
-    if (String(leadId) !== socket.data.leadId) return;
+    leadId = String(leadId);
+    const state = leadState.get(leadId);
+    if (!state) return;
 
-    socket.data.granted = true;
-    socket.to(getRoom(socket.data.leadId)).emit("permission-status", { leadId: socket.data.leadId, granted: true });
-  });
+    state.permission = true;
 
-  // Keep a heartbeat to mark active
-  socket.on("heartbeat", ({ leadId, role }) => {
-    const id = String(leadId || socket.data.leadId || "");
-    if (!id) return;
-    const st = leadState.get(id) || {};
-    st.lastSeen = Date.now();
-    leadState.set(id, st);
+    socket.to(room(leadId)).emit("permission-status", { granted: true });
   });
 
   socket.on("sync-event", (data) => {
     const leadId = socket.data.leadId;
     if (!leadId) return;
 
-    // Only allow visitor to broadcast *after permission granted*
-    if (socket.data.role === "visitor" && !socket.data.granted) {
-      // Allow only minimal state updates before permission if you want
-      if (data?.type !== "navigate") return;
+    const state = leadState.get(leadId);
+    if (!state) return;
+
+    if (data.type === "navigate") {
+      state.url = data.url;
     }
 
-    // Validate navigate URLs (optional but recommended)
-    if (data?.type === "navigate") {
-      if (!data.url || !isAllowedUrl(data.url)) return;
-
-      const st = leadState.get(leadId) || {};
-      st.url = data.url;
-      st.lastSeen = Date.now();
-      leadState.set(leadId, st);
+    if (data.type === "v-scroll") {
+      state.scrollX = data.x;
+      state.scrollY = data.y;
     }
 
-    if (data?.type === "v-scroll") {
-      const st = leadState.get(leadId) || {};
-      st.scrollXRatio = data.x;
-      st.scrollYRatio = data.y;
-      st.lastSeen = Date.now();
-      leadState.set(leadId, st);
-    }
-
-    // Broadcast to everyone else in room
-    socket.to(getRoom(leadId)).emit("sync-event", data);
+    socket.to(room(leadId)).emit("sync-event", data);
   });
 
   socket.on("disconnect", () => {
-    const leadId = socket.data.leadId;
-    const role = socket.data.role;
+    const { leadId, role } = socket.data;
+    if (!leadId) return;
 
-    if (leadId && role === "visitor") {
-      // only delete mapping if it matches this socket
-      const mapped = leadToVisitorSocket.get(leadId);
-      if (mapped === socket.id) {
-        leadToVisitorSocket.delete(leadId);
-        socket.to(getRoom(leadId)).emit("presence", { leadId, visitor: "offline" });
-      }
+    if (role === "visitor") {
+      visitorSocketByLead.delete(leadId);
+      socket.to(room(leadId)).emit("presence", { visitor: "offline" });
     }
 
-    if (leadId && role === "admin") {
-      const set = leadToAdminSockets.get(leadId);
+    if (role === "admin") {
+      const set = adminSocketsByLead.get(leadId);
       if (set) {
         set.delete(socket.id);
-        if (set.size === 0) leadToAdminSockets.delete(leadId);
+        if (set.size === 0) adminSocketsByLead.delete(leadId);
       }
     }
   });
 });
 
-server.listen(process.env.PORT || 3000, () => console.log("Server Live"));
+server.listen(process.env.PORT || 3000, () =>
+  console.log("Cobrowse server live")
+);
